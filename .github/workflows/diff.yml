@@ -1,0 +1,461 @@
+name: Diff
+
+# Automatically diffs each newly-released macOS and iOS build against the
+# previously-recorded one. A cron polls AppleDB a few times a day; a run only
+# does work when a build it has not already diffed appears. Manual runs with
+# explicit builds are still supported via workflow_dispatch.
+on:
+  schedule:
+    # Once a day at ~11:30 America/Denver, when Apple usually posts new builds.
+    # Cron is UTC and does NOT observe DST: 17:30 UTC is 11:30 MDT (summer); in
+    # MST (winter) the same line lands at 10:30 local.
+    - cron: '30 17 * * *'  # 11:30 MDT (17:30 UTC)
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'OS to diff'
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - macOS
+          - iOS
+      prev_build:
+        description: 'Previous build (manual override; requires next_build)'
+        required: false
+        type: string
+      next_build:
+        description: 'Next build (manual override; requires prev_build)'
+        required: false
+        type: string
+
+# Least privilege: nothing by default, the job opts into contents:write so it
+# can commit and push new diffs.
+permissions: {}
+
+# Serialize runs so overlapping crons never race on the push. Never cancel a
+# run mid-diff: an interrupted diff leaves a partial directory.
+concurrency:
+  group: auto-diff
+  cancel-in-progress: false
+
+jobs:
+  diff:
+    permissions:
+      contents: write
+      models: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      # One leg at a time: each leg checks out after the previous one pushed,
+      # so commits to the same branch can't collide.
+      max-parallel: 1
+      matrix:
+        include:
+          - os: macOS
+            device: Mac17,6
+            output: macOS
+          - os: iOS
+            device: iPhone18,1
+            output: iOS
+    env:
+      DIFF_OUTPUT: ${{ matrix.output }}
+    steps:
+      - name: Checkout
+        # persist-credentials stays on (default): the job pushes new diffs.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      # Skip this matrix leg when a manual run targeted only the other OS.
+      - name: Should this OS run?
+        id: gate
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          REQUESTED_OS: ${{ github.event.inputs.os }}
+        run: |
+          # REQUESTED_OS is empty for cron/push and 'both'|'macOS'|'iOS' for
+          # manual runs. Run this leg unless a specific other OS was requested.
+          if [ -n "$REQUESTED_OS" ] && [ "$REQUESTED_OS" != "both" ] && [ "$REQUESTED_OS" != "$MATRIX_OS" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping $MATRIX_OS (manual run requested $REQUESTED_OS only)"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A diff of two IPSWs needs both present at once; UniversalMac images are
+      # ~15 GB each, so reclaim the preinstalled toolchains a standard runner
+      # ships with to fit the pair plus extraction. Swap is kept (16 GB RAM).
+      - name: Free up disk space
+        if: steps.gate.outputs.run == 'true'
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          tool-cache: true
+          swap-storage: false
+
+      - name: Install ipsw
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="$(gh api repos/blacktop/ipsw/releases/latest \
+            --jq '.assets[] | select(.name | test("^ipsw_.*linux_x86_64\\.deb$")) | .browser_download_url')"
+          curl -fsSL -o /tmp/ipsw.deb "$url"
+          sudo dpkg -i /tmp/ipsw.deb
+          ipsw version
+
+      # AppleDB is cloned locally for --show-latest; cache it so each poll
+      # doesn't re-clone hundreds of MB.
+      - name: Cache AppleDB
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.config/ipsw
+          key: appledb-${{ runner.os }}
+
+      # Decide whether there is a new build to diff. Writes prev/next build
+      # info to the step outputs consumed by the diff step.
+      - name: Detect new build
+        id: detect
+        if: steps.gate.outputs.run == 'true'
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          DEVICE: ${{ matrix.device }}
+          MANUAL_PREV: ${{ github.event.inputs.prev_build }}
+          MANUAL_NEXT: ${{ github.event.inputs.next_build }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cache_file=".cache/${MATRIX_OS}.json"
+
+          # Manual override: caller supplied both builds explicitly.
+          if [ -n "$MANUAL_PREV" ] && [ -n "$MANUAL_NEXT" ]; then
+            echo "Manual override: $MANUAL_PREV -> $MANUAL_NEXT"
+            {
+              echo "do_diff=true"
+              echo "prev_build=$MANUAL_PREV"
+              echo "prev_version=manual"
+              echo "next_build=$MANUAL_NEXT"
+              echo "next_version=manual"
+              echo "next_major=manual"
+              echo "next_released="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Latest available build for this device, as JSON.
+          latest_json="$(ipsw dl appledb --os "$MATRIX_OS" --device "$DEVICE" --show-latest --no-color)"
+          next_version="$(printf '%s' "$latest_json" | jq -r '.version')"
+          next_build="$(printf '%s' "$latest_json" | jq -r '.build')"
+          next_released="$(printf '%s' "$latest_json" | jq -r '.released // empty')"
+          if [ -z "$next_build" ] || [ "$next_build" = "null" ]; then
+            echo "::warning::AppleDB returned no build for $MATRIX_OS $DEVICE"
+            echo "do_diff=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Major version: the integer before the first dot of e.g. "27.0 beta".
+          # The cache is keyed by this so overlapping beta tracks (a 26.x
+          # maintenance line and a 27.x line releasing in the same window) never
+          # diff against each other — a build is only ever diffed against the
+          # previous build of its OWN major, and only forward in time.
+          next_major="$(printf '%s' "$next_version" | grep -oE '^[0-9]+')"
+          echo "Latest $MATRIX_OS: $next_version ($next_build), major ${next_major}"
+
+          record_baseline() {
+            mkdir -p .cache
+            local tmp
+            tmp="$(mktemp)"
+            if [ -f "$cache_file" ]; then
+              jq --arg m "$next_major" --arg v "$next_version" --arg b "$next_build" --arg r "$next_released" \
+                '.[$m] = {version:$v, build:$b, released:$r}' "$cache_file" > "$tmp"
+            else
+              jq -n --arg m "$next_major" --arg v "$next_version" --arg b "$next_build" --arg r "$next_released" \
+                '{($m): {version:$v, build:$b, released:$r}}' > "$tmp"
+            fi
+            mv "$tmp" "$cache_file"
+          }
+
+          # Bootstrap: no cache yet — record this major's latest as its baseline.
+          if [ ! -f "$cache_file" ]; then
+            record_baseline
+            echo "Bootstrapped $cache_file at $next_build; nothing to diff yet"
+            echo "do_diff=false" >> "$GITHUB_OUTPUT"
+            echo "bootstrap=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prev_build="$(jq -r --arg m "$next_major" '.[$m].build // empty' "$cache_file")"
+          prev_version="$(jq -r --arg m "$next_major" '.[$m].version // empty' "$cache_file")"
+          prev_released="$(jq -r --arg m "$next_major" '.[$m].released // empty' "$cache_file")"
+
+          # First sighting of this major. Record the baseline but do not diff
+          # across majors; a milestone diff (last 26.x -> first 27.x) is run by
+          # hand via workflow_dispatch with explicit prev/next builds.
+          if [ -z "$prev_build" ]; then
+            record_baseline
+            echo "First $MATRIX_OS ${next_major}.x build ($next_build); recorded baseline, not diffing across majors"
+            echo "do_diff=false" >> "$GITHUB_OUTPUT"
+            echo "new_major=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Already current for this major.
+          if [ "$prev_build" = "$next_build" ]; then
+            echo "No new $MATRIX_OS ${next_major}.x build (still $next_build)"
+            echo "do_diff=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Forward only: never diff backwards within a major (guards against
+          # AppleDB re-surfacing a pulled build). Dates are ISO 8601, so a
+          # lexical compare orders them correctly.
+          if [ -n "$prev_released" ] && [ -n "$next_released" ] && [[ "$next_released" < "$prev_released" ]]; then
+            echo "::warning::Latest ${next_major}.x build $next_build ($next_released) is older than recorded $prev_build ($prev_released); skipping"
+            echo "do_diff=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Belt-and-suspenders: a diff directory already ending in the next
+          # build means we produced it before (e.g. cache lost). Re-record and
+          # skip rather than redo the work.
+          if compgen -G "$DIFF_OUTPUT/*_${next_build}" > /dev/null; then
+            echo "Diff dir for $next_build already exists; re-recording cache, skipping"
+            record_baseline
+            echo "do_diff=false" >> "$GITHUB_OUTPUT"
+            echo "recache_only=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "New $MATRIX_OS ${next_major}.x build: $prev_build -> $next_build"
+          {
+            echo "do_diff=true"
+            echo "prev_build=$prev_build"
+            echo "prev_version=$prev_version"
+            echo "next_build=$next_build"
+            echo "next_version=$next_version"
+            echo "next_major=$next_major"
+            echo "next_released=$next_released"
+          } >> "$GITHUB_OUTPUT"
+
+      # To diff the dyld_shared_cache, MachOs, files and entitlements, ipsw
+      # mounts the decrypted APFS volumes (root fs, SystemOS, AppOS, ExclaveOS).
+      # On Linux that mount needs apfs-fuse, which the runner does not ship, so
+      # build it (pinned) — only when we are actually about to diff. Without it
+      # ipsw still diffs the kernelcache and firmware (they live unencrypted in
+      # the IPSW), but the filesystem half of the diff is silently empty.
+      - name: Install apfs-fuse
+        if: steps.gate.outputs.run == 'true' && steps.detect.outputs.do_diff == 'true'
+        env:
+          # Pinned: sgan81/apfs-fuse master has been stable since 2023-03-12.
+          APFS_FUSE_SHA: 66b86bd525e8cb90f9012543be89b1f092b75cf3
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 libfuse3-dev libbz2-dev libattr1-dev zlib1g-dev cmake g++ git
+          src="$RUNNER_TEMP/apfs-fuse"
+          git clone --quiet https://github.com/sgan81/apfs-fuse.git "$src"
+          git -C "$src" checkout --quiet "$APFS_FUSE_SHA"
+          git -C "$src" submodule update --init --recursive --quiet
+          cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$src/build" --parallel "$(nproc)"
+          sudo install -m 0755 "$src/build/apfs-fuse" /usr/local/bin/apfs-fuse
+          command -v apfs-fuse
+
+      # Kernel symbolicator signatures, so the kernelcache/KEXT diff carries
+      # function names. Version-keyed under kernel/; ipsw picks the right set.
+      - name: Fetch symbolicator signatures
+        if: steps.gate.outputs.run == 'true' && steps.detect.outputs.do_diff == 'true'
+        run: git clone --quiet --depth 1 https://github.com/blacktop/symbolicator.git "$RUNNER_TEMP/symbolicator"
+
+      # The dyld_shared_cache diff holds ~14M symbols in memory and OOM-kills the
+      # 16 GB runner mid-diff (the VM dies -> "runner received a shutdown
+      # signal", not a timeout). Back the spike with a big swapfile. Prefer /mnt
+      # (separate ephemeral disk, away from the IPSWs under $RUNNER_TEMP on /);
+      # GitHub is moving to single-disk images where /mnt may be absent, so fall
+      # back to / and size to whatever the chosen disk can spare.
+      - name: Add swap
+        if: steps.gate.outputs.run == 'true' && steps.detect.outputs.do_diff == 'true'
+        run: |
+          set -euo pipefail
+          swapdir=/mnt
+          df "$swapdir" >/dev/null 2>&1 || swapdir=/
+          avail_g="$(df -P "$swapdir" | awk 'NR==2 {print int($4/1024/1024)}')"
+          # Leave the disk headroom; cap the swapfile at 28G.
+          size_g=$(( avail_g - 10 )); [ "$size_g" -gt 28 ] && size_g=28
+          if [ "$size_g" -lt 8 ]; then
+            echo "::warning::Only ${avail_g}G free on ${swapdir}; skipping swap (diff may OOM)"
+            exit 0
+          fi
+          swapfile="$swapdir/swapfile"
+          sudo fallocate -l "${size_g}G" "$swapfile" || sudo dd if=/dev/zero of="$swapfile" bs=1M count=$(( size_g * 1024 ))
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile" >/dev/null
+          sudo swapon "$swapfile"
+          echo "Added ${size_g}G swap at ${swapfile}"
+          free -h
+
+      - name: Download and diff
+        if: steps.gate.outputs.run == 'true' && steps.detect.outputs.do_diff == 'true'
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          DEVICE: ${{ matrix.device }}
+          PREV_BUILD: ${{ steps.detect.outputs.prev_build }}
+          NEXT_BUILD: ${{ steps.detect.outputs.next_build }}
+          NEXT_VERSION: ${{ steps.detect.outputs.next_version }}
+          NEXT_MAJOR: ${{ steps.detect.outputs.next_major }}
+          NEXT_RELEASED: ${{ steps.detect.outputs.next_released }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prev_dir="$RUNNER_TEMP/prev"
+          next_dir="$RUNNER_TEMP/next"
+          mkdir -p "$prev_dir" "$next_dir"
+
+          echo "::group::Download $MATRIX_OS $PREV_BUILD"
+          ipsw dl appledb --os "$MATRIX_OS" --device "$DEVICE" --build "$PREV_BUILD" --output "$prev_dir" --confirm
+          echo "::endgroup::"
+          echo "::group::Download $MATRIX_OS $NEXT_BUILD"
+          ipsw dl appledb --os "$MATRIX_OS" --device "$DEVICE" --build "$NEXT_BUILD" --output "$next_dir" --confirm
+          echo "::endgroup::"
+
+          echo "::group::Diff"
+          mkdir -p "$DIFF_OUTPUT"
+          ipsw diff --output "$DIFF_OUTPUT" \
+            --markdown \
+            --fw \
+            --launchd \
+            --feat \
+            --strs \
+            --ent \
+            --files \
+            --starts \
+            --signatures "$RUNNER_TEMP/symbolicator/kernel" \
+            --block-list "__TEXT.__info_plist" \
+            --block-list "__AUTH_CONST.__auth_ptr" \
+            "$prev_dir"/*.ipsw \
+            "$next_dir"/*.ipsw
+          echo "::endgroup::"
+
+          # Record the build we just diffed up to, under its major-version key
+          # (skipped on a manual override where the real version is unknown).
+          if [ "$NEXT_VERSION" != "manual" ]; then
+            mkdir -p .cache
+            cache_file=".cache/${MATRIX_OS}.json"
+            tmp="$(mktemp)"
+            jq --arg m "$NEXT_MAJOR" --arg v "$NEXT_VERSION" --arg b "$NEXT_BUILD" --arg r "$NEXT_RELEASED" \
+              '.[$m] = {version:$v, build:$b, released:$r}' "$cache_file" > "$tmp"
+            mv "$tmp" "$cache_file"
+          fi
+
+      - name: Generate README metadata
+        id: readme_metadata
+        if: steps.gate.outputs.run == 'true' && steps.detect.outputs.do_diff == 'true' && steps.detect.outputs.next_version != 'manual'
+        continue-on-error: true
+        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
+        with:
+          model: openai/gpt-5
+          system-prompt: |
+            Return only a JSON object. Do not use markdown fences.
+            Use exactly these keys:
+              - section_label
+              - previous_label
+              - next_label
+            The section_label must group beta releases without the beta number, such as "macOS 27.0 beta".
+            The previous_label and next_label must include version text plus build in parentheses.
+          prompt: |
+            Create README index labels for an automated Apple firmware diff.
+
+            OS: ${{ matrix.os }}
+            Previous version: ${{ steps.detect.outputs.prev_version }}
+            Previous build: ${{ steps.detect.outputs.prev_build }}
+            Next version: ${{ steps.detect.outputs.next_version }}
+            Next build: ${{ steps.detect.outputs.next_build }}
+
+      - name: Update README index
+        if: steps.gate.outputs.run == 'true' && steps.detect.outputs.do_diff == 'true' && steps.detect.outputs.next_version != 'manual'
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          PREV_VERSION: ${{ steps.detect.outputs.prev_version }}
+          PREV_BUILD: ${{ steps.detect.outputs.prev_build }}
+          NEXT_VERSION: ${{ steps.detect.outputs.next_version }}
+          NEXT_BUILD: ${{ steps.detect.outputs.next_build }}
+          README_AI_JSON: ${{ steps.readme_metadata.outputs.response }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/update-readme-index.py \
+            --os "$MATRIX_OS" \
+            --prev-version "$PREV_VERSION" \
+            --prev-build "$PREV_BUILD" \
+            --next-version "$NEXT_VERSION" \
+            --next-build "$NEXT_BUILD" \
+            --ai-json "$README_AI_JSON"
+
+      # Single commit/push path for all outcomes: a fresh diff, a bootstrapped
+      # baseline, or a re-recorded cache. Skips cleanly when nothing changed
+      # (e.g. "no new build"). Without this, bootstrap/recache would rewrite
+      # .cache locally but never persist it, re-triggering every run.
+      - name: Commit and push
+        if: steps.gate.outputs.run == 'true'
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          PREV_BUILD: ${{ steps.detect.outputs.prev_build }}
+          NEXT_BUILD: ${{ steps.detect.outputs.next_build }}
+          DO_DIFF: ${{ steps.detect.outputs.do_diff }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'blacktop'
+          git config user.email 'blacktop@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          if [ "$DO_DIFF" = "true" ]; then
+            msg="Automated Diff of ${MATRIX_OS} ${PREV_BUILD} -> ${NEXT_BUILD}"
+          else
+            msg="chore(${MATRIX_OS}): record build baseline"
+          fi
+          git commit -m "$msg"
+
+          # The serialized matrix makes pushes ordered, but retry-with-rebase
+          # guards against a concurrently-merged commit (the legs touch disjoint
+          # files, so a rebase is conflict-free).
+          for attempt in 1 2 3; do
+            if git push; then
+              break
+            fi
+            echo "push failed (attempt $attempt); rebasing"
+            git pull --rebase --autostash
+          done
+
+      - name: Summary
+        if: steps.gate.outputs.run == 'true'
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          DO_DIFF: ${{ steps.detect.outputs.do_diff }}
+          PREV_BUILD: ${{ steps.detect.outputs.prev_build }}
+          NEXT_BUILD: ${{ steps.detect.outputs.next_build }}
+          BOOTSTRAP: ${{ steps.detect.outputs.bootstrap }}
+          RECACHE: ${{ steps.detect.outputs.recache_only }}
+          NEW_MAJOR: ${{ steps.detect.outputs.new_major }}
+        run: |
+          {
+            echo "### ${MATRIX_OS}"
+            if [ "$DO_DIFF" = "true" ]; then
+              echo "- Diffed \`${PREV_BUILD}\` → \`${NEXT_BUILD}\`"
+            elif [ "$BOOTSTRAP" = "true" ]; then
+              echo "- Bootstrapped baseline; nothing to diff yet"
+            elif [ "$NEW_MAJOR" = "true" ]; then
+              echo "- First build of a new major; recorded baseline (no cross-major diff)"
+            elif [ "$RECACHE" = "true" ]; then
+              echo "- Diff already existed; re-recorded cache only"
+            else
+              echo "- No new build"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
