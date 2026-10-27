@@ -58,7 +58,7 @@ jobs:
             device: Mac17,6
             output: macOS
           - os: iOS
-            device: iPhone18,1
+            device: iPhone16,1
             output: iOS
     env:
       DIFF_OUTPUT: ${{ matrix.output }}
