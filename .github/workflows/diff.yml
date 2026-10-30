@@ -5,11 +5,6 @@ name: Diff
 # does work when a build it has not already diffed appears. Manual runs with
 # explicit builds are still supported via workflow_dispatch.
 on:
-  schedule:
-    # Once a day at ~11:30 America/Denver, when Apple usually posts new builds.
-    # Cron is UTC and does NOT observe DST: 17:30 UTC is 11:30 MDT (summer); in
-    # MST (winter) the same line lands at 10:30 local.
-    - cron: '30 17 * * *'  # 11:30 MDT (17:30 UTC)
   workflow_dispatch:
     inputs:
       os:
