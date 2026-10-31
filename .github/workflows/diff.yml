@@ -4,6 +4,8 @@ name: Diff
 # previously-recorded one. A cron polls AppleDB a few times a day; a run only
 # does work when a build it has not already diffed appears. Manual runs with
 # explicit builds are still supported via workflow_dispatch.
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 on:
   workflow_dispatch:
     inputs:
