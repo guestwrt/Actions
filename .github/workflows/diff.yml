@@ -4,8 +4,6 @@ name: Diff
 # previously-recorded one. A cron polls AppleDB a few times a day; a run only
 # does work when a build it has not already diffed appears. Manual runs with
 # explicit builds are still supported via workflow_dispatch.
-env:
-  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 on:
   workflow_dispatch:
     inputs:
@@ -42,7 +40,7 @@ jobs:
     permissions:
       contents: write
       models: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -89,7 +87,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
-          tool-cache: true
+          preinstalled-runtimes: true
           swap-storage: false
 
       - name: Install ipsw
