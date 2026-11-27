@@ -117,10 +117,9 @@ jobs:
           sed -i '$a\RELEASE_STORE_PASSWORD=TVBoxOSC'       ./gradle.properties
           sed -i '$a\RELEASE_KEY_PASSWORD=TVBoxOSC'         ./gradle.properties
       - uses: actions/setup-java@v6
-        if: ${{ matrix.java_ver }}
         with:
           distribution: temurin
-          java-version: ${{ matrix.java_ver }}
+          java-version: '17'
       - uses: gradle/actions/setup-gradle@v6.2.0
         if: ${{ env.commit }}
       - name: Build With Gradle
