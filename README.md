@@ -7,4 +7,4 @@
 
 ## Credits
 This repo relies on the following third-party projects:
-- [q215613905/TVBoxOS](https://github.com/q215613905/TVBoxOS) (Updated: ab11d289e09963a9daf65ca7f6b7a9a8cbe184e1)
+- [q215613905/TVBoxOS](https://github.com/q215613905/TVBoxOS) (Updated: 5bde7df5c2a9baa4dda71c968be8edd837f89365)
