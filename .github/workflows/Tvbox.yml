@@ -81,7 +81,7 @@ jobs:
         if: ${{ env.commit }}
         uses: actions/setup-python@v7
         with:
-          python-version: '3.8'
+          python-version: '3.11'
 
       - name: Install Python dependencies
         #if: ${{ matrix.userName == 'q215613905' && env.commit }}
@@ -118,9 +118,8 @@ jobs:
           sed -i '$a\RELEASE_KEY_PASSWORD=TVBoxOSC'         ./gradle.properties
       - uses: actions/setup-java@v6
         with:
-          if: ${{ matrix.java_ver }}
           distribution: temurin
-          java-version: ${{ matrix.java_ver }}
+          java-version: '17'
       - uses: gradle/actions/setup-gradle@v6.2.0
         if: ${{ env.commit }}
       - name: Build With Gradle
